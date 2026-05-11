@@ -1,15 +1,17 @@
 import geopandas as gpd
-import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import xarray as xr
 import pyvista as pv
-from scipy.interpolate import griddata
-from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter
 from pyproj import Transformer
 import os
 import matplotlib.cm as cm
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.signal import savgol_filter
+from scipy.interpolate import LinearNDInterpolator, griddata
+import matplotlib.pyplot as plt
+import numpy.ma as ma
 
 
 # Further Steps
@@ -27,7 +29,7 @@ class VerticalPlotter:
     3. name of the variable to be plotted,
     4. maximum height of the transect as a list of [maximum array height, maximum plot height]
     '''
-    def __init__(self, icon_vtk, epsg, gdf_line, plot_variable, max_height, grid_width=1, interp_method='linear'):
+    def __init__(self, icon_vtk, epsg, gdf_line, plot_variable, max_height, grid_width=1, interp_method='linear', itopo=None):
         self.icon_vtk = icon_vtk.cell_data_to_point_data()
         self.epsg = epsg
         self.grid_width = grid_width
@@ -51,6 +53,9 @@ class VerticalPlotter:
         self.grid_values_z_new = None
         self.grid_values_perp = None
         self.offsets = None
+        self.rv_mode = False
+        self.itopo = itopo
+        self.height_mask = None
 
         self.scalar = True if len(self.icon_vtk.get_array(self.plot_variable).shape) == 1 else False
 
@@ -84,12 +89,83 @@ class VerticalPlotter:
         if self.gdf_line.crs != self.epsg:
             self.gdf_line = self.gdf_line.to_crs(self.epsg)
 
-        print(f"Line length: {self.gdf_line.length}")
+        #print(f"Line length: {self.gdf_line.length}")
 
         coords = np.array(self.gdf_line.geometry.values[0].coords)
         coords = np.hstack([coords, np.zeros((coords.shape[0], 1))])
 
         self.pv_line = pv.Spline(coords, n_points)
+
+    @staticmethod
+    def reorder_slice_points_by_spline(slice, spline):
+        spline_pts = spline.points.copy()
+        slice_pts = slice.points.copy()
+
+        cumdist = np.zeros(len(spline_pts), dtype=float)
+        for i in range(1, len(spline_pts)):
+            cumdist[i] = cumdist[i - 1] + np.linalg.norm(spline_pts[i] - spline_pts[i - 1])
+
+        tree = cKDTree(spline_pts[:, :2])
+
+        dists, nearest_idx = tree.query(slice_pts[:, :2], k=1)
+
+        order_values = cumdist[nearest_idx]
+
+        tie_break = dists
+        sort_idx = np.lexsort((tie_break, order_values))
+
+        ############## Helper #############
+
+        def reorder_polydata_points_inplace(mesh: pv.PolyData, new_order: np.ndarray) -> pv.PolyData:
+            mesh = mesh.copy()
+            n = mesh.n_points
+            new_order = np.asarray(new_order, dtype=np.int64)
+            if new_order.shape[0] != n:
+                raise ValueError("new_order must have length equal to mesh.n_points")
+
+            inv = np.empty(n, dtype=np.int64)
+            inv[new_order] = np.arange(n, dtype=np.int64)
+
+            old_points = mesh.points.copy()
+            mesh.points = old_points[new_order]
+
+            for name in list(mesh.point_data.keys()):
+                arr = mesh.point_data[name]
+                mesh.point_data[name] = arr[new_order].copy()
+
+            def remap_indexed_array(arr):
+                if arr is None or arr.size == 0:
+                    return arr
+                arr = arr.copy()
+                i = 0
+                L = arr.size
+                while i < L:
+                    k = int(arr[i])
+                    if k <= 0:
+                        i += 1
+                        continue
+                    for j in range(i + 1, i + 1 + k):
+                        old_id = int(arr[j])
+                        arr[j] = int(inv[old_id])
+                    i += k + 1
+                return arr
+
+            if mesh.verts is not None and mesh.verts.size > 0:
+                mesh.verts = remap_indexed_array(mesh.verts)
+            if mesh.lines is not None and mesh.lines.size > 0:
+                mesh.lines = remap_indexed_array(mesh.lines)
+            if mesh.faces is not None and mesh.faces.size > 0:
+                mesh.faces = remap_indexed_array(mesh.faces)
+
+            return mesh
+
+        ############ Helper End ###########
+
+        ordered_mesh = reorder_polydata_points_inplace(slice, new_order=sort_idx)
+
+        ordered_mesh.point_data['ordered_idx'] = np.arange(ordered_mesh.n_points, dtype=float)
+
+        return ordered_mesh
 
     def generate_icon_slice(self):
         '''
@@ -111,10 +187,65 @@ class VerticalPlotter:
 
         clipped_vtk = self.icon_vtk.extract_points(mask, include_cells=True)
 
-        self.slice = clipped_vtk.slice_along_line(self.pv_line, progress_bar=True)
+        self.slice = clipped_vtk.slice_along_line(self.pv_line, progress_bar=False)
 
+        self.slice = self.reorder_slice_points_by_spline(self.slice, self.pv_line)
 
-    def interpolate_icon_slice(self):
+        if self.itopo is not None:
+            x_bounds = (self.pv_line.points[:, 0].min(), self.pv_line.points[:, 0].max())
+            y_bounds = (self.pv_line.points[:, 1].min(), self.pv_line.points[:, 1].max())
+            z_bounds = (self.itopo.points[:, 2].min(), self.itopo.points[:, 2].max())
+
+            all_points = self.itopo.points
+            mask = (
+                    (all_points[:, 0] >= x_bounds[0]) & (all_points[:, 0] <= x_bounds[1]) &
+                    (all_points[:, 1] >= y_bounds[0]) & (all_points[:, 1] <= y_bounds[1]) &
+                    (all_points[:, 2] >= z_bounds[0]) & (all_points[:, 2] <= z_bounds[1])
+            )
+
+            clipped_itopo = self.itopo.extract_points(mask, include_cells=True)
+
+            self.z_slice = clipped_itopo.slice_along_line(self.pv_line, progress_bar=False)
+            self.z_slice = self.reorder_slice_points_by_spline(self.z_slice, self.pv_line)
+
+    @staticmethod
+    def project2LOS(slice, station_coords, invert=True):
+        points = slice.points
+
+        x = points[:, 0]
+        y = points[:, 1]
+        z = points[:, 2]
+        u = slice.get_array("u")
+        v = slice.get_array("v")
+        w = slice.get_array("w")
+        pos = np.column_stack([x, y, z])
+        uvec = np.column_stack([u, v, w])
+        sensor = np.array([station_coords[0], station_coords[1], station_coords[2]])
+
+        R = pos - sensor
+
+        dist = np.linalg.norm(R, axis=1)
+
+        tol = 1e-12
+        near0 = dist < tol
+
+        Rhat = np.empty_like(R)
+        Rhat[~near0] = R[~near0] / dist[~near0, None]
+        Rhat[near0] = np.nan
+
+        v_rad = np.einsum('ij,ij->i', uvec, Rhat)
+
+        #v_rad_toward_sensor = -v_rad
+
+        v_rad[near0] = np.nan
+        #v_rad_toward_sensor[near0] = np.nan
+
+        if invert:
+            return v_rad#_toward_sensor
+        else:
+            return v_rad
+
+    def interpolate_icon_slice(self, rv_mode=False, station_coords=None, invert=True):
         '''
         Interpolates the slice according to the chosen interpolation method and stores the resulting arrays and arrays coordinates in the class.
         '''
@@ -122,9 +253,8 @@ class VerticalPlotter:
 
         if self.scalar:
             concat_array = np.concatenate((self.slice.points, self.slice.get_array(self.plot_variable)[:, None]), axis=1)
-            sorted_indices = np.argsort(concat_array[:, 0])
-            sorted_points = self.slice.points[sorted_indices]
-            x, y, z = sorted_points[:, 0], sorted_points[:, 1], sorted_points[:, 2]
+            points = self.slice.points
+            x, y, z = points[:, 0], points[:, 1], points[:, 2]
 
             if self.epsg == "EPSG:4326":
                 transformer = Transformer.from_crs("EPSG:4326", "EPSG:32632", always_xy=True)
@@ -138,7 +268,7 @@ class VerticalPlotter:
             line_length = np.sum(dsts)
             lon = np.concatenate([[0], np.cumsum(dsts)])
 
-            values = self.slice.get_array(self.plot_variable)[sorted_indices]
+            values = self.slice.get_array(self.plot_variable)
 
             loni = np.arange(lon.min(), lon.max(), self.grid_width)
             zi = np.arange(z.min(), z.max(), self.grid_width)
@@ -155,9 +285,142 @@ class VerticalPlotter:
 
         else:
             concat_array = np.concatenate((self.slice.points, self.slice.get_array(self.plot_variable)), axis=1)
-            sorted_indices = np.argsort(concat_array[:, 0])
-            sorted_points = self.slice.points[sorted_indices]
-            x, y, z = sorted_points[:, 0], sorted_points[:, 1], sorted_points[:, 2]
+
+            pts = concat_array[:, 0:2]
+            z_vals = concat_array[:, 2]
+
+            if self.epsg == "EPSG:4326":
+                transformer = Transformer.from_crs("EPSG:4326", "EPSG:32632", always_xy=True)
+                x, y = transformer.transform(x, y)
+
+            if self.plot_variable == "wind":
+                uvecs_3d = np.column_stack(
+                    [self.slice.get_array("u"), self.slice.get_array("v"), self.slice.get_array("w")])
+            else:
+                print("Only wind as vector implemented...")
+                return None
+
+            N = len(pts)
+            z_hat = np.array([0.0, 0.0, 1.0])
+
+            same_next = np.logical_and(np.isclose(pts[1:, 0], pts[:-1, 0]), np.isclose(pts[1:, 1], pts[:-1, 1]))
+            keep_mask = np.ones(N, dtype=bool)
+            keep_mask[1:] = ~same_next
+
+            unique_xy = pts[keep_mask]
+            M = len(unique_xy)
+
+            dx = np.diff(unique_xy[:, 0])
+            dy = np.diff(unique_xy[:, 1])
+            seg = np.hypot(dx, dy)
+            s_unique = np.concatenate([[0.0], np.cumsum(seg)])  # length M
+
+            if M >= 7:
+                wl = 7 if (7 % 2 == 1) else 7 + 1
+                x_s = savgol_filter(unique_xy[:, 0], wl, polyorder=2, mode='interp')
+                y_s = savgol_filter(unique_xy[:, 1], wl, polyorder=2, mode='interp')
+            else:
+                x_s = unique_xy[:, 0].copy()
+                y_s = unique_xy[:, 1].copy()
+
+            dx_s = np.gradient(x_s)
+            dy_s = np.gradient(y_s)
+            speed_s = np.hypot(dx_s, dy_s)
+            speed_s[speed_s < 1e-12] = np.nan
+            tx = dx_s / speed_s
+            ty = dy_s / speed_s
+            valid = ~np.isnan(tx)
+            if not valid.all():
+                idx_valid = np.where(valid)[0]
+                tx = np.interp(np.arange(M), idx_valid, tx[idx_valid])
+                ty = np.interp(np.arange(M), idx_valid, ty[idx_valid])
+            t_unique = np.vstack([tx, ty, np.zeros_like(tx)]).T
+
+            n_unique = np.cross(np.array([0., 0., 1.]), t_unique)
+            n_norm = np.linalg.norm(n_unique, axis=1)
+            n_norm[n_norm < 1e-12] = 1.0
+            n_unique = (n_unique.T / n_norm).T
+
+            tree = cKDTree(unique_xy)
+            dists, idx_nearest = tree.query(pts, k=1)
+
+            s_samples = s_unique[idx_nearest]
+            t_samples = t_unique[idx_nearest]
+            n_samples = n_unique[idx_nearest]
+
+            dot_un = np.einsum('ij,ij->i', uvecs_3d, n_samples)
+            u_proj = uvecs_3d - dot_un[:, None] * n_samples
+
+            u_along = np.einsum('ij,ij->i', u_proj, t_samples)
+            u_vert = u_proj[:, 2]
+
+            points = np.column_stack([s_samples, z_vals])
+            interp_along = LinearNDInterpolator(points, u_along)
+            interp_vert = LinearNDInterpolator(points, u_vert)
+
+            interp_x = LinearNDInterpolator(points, uvecs_3d[:, 0])
+            interp_y = LinearNDInterpolator(points, uvecs_3d[:, 1])
+            interp_w = LinearNDInterpolator(points, uvecs_3d[:, 2])
+
+            if rv_mode:
+                self.rv_mode = True
+                v_rad = self.project2LOS(slice = self.slice, station_coords=station_coords, invert=invert)
+                interp_rad = LinearNDInterpolator(points, v_rad)
+
+            s_grid = np.arange(s_unique.min(), s_unique.max() + self.grid_width, self.grid_width)
+            z_grid = np.arange(z_vals.min(), z_vals.max(), self.grid_width)
+            loni, zi = np.meshgrid(s_grid, z_grid)
+
+            Ns = len(s_grid)
+            Nz = len(z_grid)
+            if rv_mode:
+                grid_v_rad = np.empty((Nz, Ns))
+            grid_u_along = np.empty((Nz, Ns))
+            grid_u_vert = np.empty((Nz, Ns))
+
+            grid_x = np.empty((Nz, Ns))
+            grid_y = np.empty((Nz, Ns))
+            grid_w = np.empty((Nz, Ns))
+
+            for iz, z0 in enumerate(z_grid):
+                pts_row = np.column_stack([s_grid, np.full(Ns, z0)])
+                grid_u_along[iz, :] = interp_along(pts_row)
+                grid_u_vert[iz, :] = interp_vert(pts_row)
+
+                grid_x[iz, :] = interp_x(pts_row)
+                grid_y[iz, :] = interp_y(pts_row)
+                grid_w[iz, :] = interp_w(pts_row)
+
+                if rv_mode:
+                    grid_v_rad[iz, :] = interp_rad(pts_row)
+
+            signed_offsets = np.einsum('ij,ij->i', uvecs_3d, n_samples)
+
+            interp_offsets = LinearNDInterpolator(points, signed_offsets)
+            grid_offsets = np.empty((Nz, Ns))
+
+            for iz, z0 in enumerate(z_grid):
+                pts_row = np.column_stack([s_grid, np.full(Ns, z0)])
+                grid_offsets[iz, :] = interp_offsets(pts_row)
+
+            self.grid_values_lon = grid_u_along  # Nz x Ns
+            self.grid_values_z_new = grid_w  # Nz x Ns (original 3rd component on grid)
+            self.grid_values_x = grid_x  # Nz x Ns
+            self.grid_values_y = grid_y  # Nz x Ns
+            self.grid_values_z = grid_w  # Nz x Ns    (mirror of grid_values_z_new to keep same names)
+            self.loni = loni  # Nz x Ns (meshgrid of s, z)
+            self.zi = zi  # Nz x Ns
+            self.lon = s_samples  # length N, per-sample 'distance along' (maps to self.values)
+            self.z = z_vals  # length N, per-sample z
+            self.values = uvecs_3d  # N x 3 (original vectors u,v,w)
+            self.offsets = grid_offsets  # Nz x Ns (interpolated signed offsets)
+            if rv_mode:
+                self.rv_grid = grid_v_rad
+
+        if self.itopo is not None:
+            h = self.z_slice.get_array("z_ifc")
+            points = self.z_slice.points
+            x, y, z = points[:, 0], points[:, 1], points[:, 2]
 
             if self.epsg == "EPSG:4326":
                 transformer = Transformer.from_crs("EPSG:4326", "EPSG:32632", always_xy=True)
@@ -165,59 +428,52 @@ class VerticalPlotter:
 
             x = np.array(x)
             y = np.array(y)
+            z = np.array(z)
 
-            dx = x[-1] - x[0]
-            dy = y[-1] - y[0]
-            line_length = np.sqrt(dx ** 2 + dy ** 2)
-            t_x = dx / line_length
-            t_y = dy / line_length
-            lon = (x - x[0]) * t_x + (y - y[0]) * t_y
-
-
-            values = self.slice.get_array(self.plot_variable)[sorted_indices]
-
+            dsts = np.sqrt((x[1:] - x[:-1]) ** 2 + (y[1:] - y[:-1]) ** 2)
+            line_length = np.sum(dsts)
+            lon = np.concatenate([[0], np.cumsum(dsts)])
             loni = np.arange(lon.min(), lon.max(), self.grid_width)
-            zi = np.arange(z.min(), z.max(), self.grid_width)
-            loni, zi = np.meshgrid(loni, zi)
 
-            grid_values_x = griddata((lon, z), values[:,0], (loni, zi), method=self.interp_method)
-            grid_values_y = griddata((lon, z), values[:,1], (loni, zi), method=self.interp_method)
-            grid_values_z = griddata((lon, z), values[:,2], (loni, zi), method=self.interp_method)
+            #zi = np.arange(self.slice.points[:,2].min(), self.slice.points[:,2].max(), self.grid_width)
+            zmin = self.slice.points[:, 2].min()
+            zmax = self.slice.points[:, 2].max()
+            extent = zmax - zmin
+            nz = max(2, int(np.round(extent / self.grid_width)) + 1)
+            zi = np.linspace(zmin, zmax, nz)
+            
+            h_new = np.interp(loni, lon, h)
 
-            d = np.array([x[-1] - x[0], y[-1] - y[0], 0])
-            z_axis = np.array([0, 0, 1])
-            n = np.cross(z_axis, d)
+            if self.grid_values is not None:
+                nz_ref, nx_ref = self.grid_values.shape
+            else:
+                nz_ref, nx_ref = self.grid_values_x.shape
+            
+            nx = min(nx_ref, h_new.shape[0])
+            nz = min(nz_ref, zi.shape[0])
+            
+            h_new = h_new[:nx]
+            loni  = loni[:nx]
+            zi    = zi[:nz]
+            
+            if self.grid_values is not None:
+                self.grid_values = self.grid_values[:nz, :nx]
+            else:
+                self.grid_values_x = self.grid_values_x[:nz, :nx]
+                self.grid_values_y = self.grid_values_y[:nz, :nx]
+                self.grid_values_z = self.grid_values_z[:nz, :nx]
+                self.grid_values_lon = self.grid_values_lon[:nz, :nx]
+                self.grid_values_z_new = self.grid_values_z_new[:nz, :nx]
+                self.offsets = self.offsets[:nz, :nx]
+                if self.rv_mode:
+                    self.rv_grid = self.rv_grid[:nz, :nx]
 
-            def vector2proj(us, n):
-                n_norm = np.linalg.norm(n)
-                dot_prods = np.dot(us, n)
-                offset_vectors = (dot_prods[:, np.newaxis]) * n / n_norm ** 2
-                us_proj = us - offset_vectors
-                s_dists = dot_prods / n_norm
+            zi = zi[:, None]
+            h_new = h_new[None, :]
 
-                return us_proj, s_dists, offset_vectors
-
-            proj_v, signed_offsets, _ = vector2proj(us=values, n=n)
-
-
-            grid_offsets = griddata((lon, z), signed_offsets, (loni, zi), method=self.interp_method)
-
-            u_lon = proj_v[:,0] * t_x + proj_v[:,1] * t_y
-
-            grid_values_lon = griddata((lon, z), u_lon, (loni, zi), method=self.interp_method)
-            grid_values_z_new = griddata((lon, z), values[:,2], (loni, zi), method=self.interp_method)
-
-            self.grid_values_lon = grid_values_lon
-            self.grid_values_z_new = grid_values_z_new
-            self.grid_values_x = grid_values_x
-            self.grid_values_y = grid_values_y
-            self.grid_values_z = grid_values_z
-            self.loni = loni
-            self.zi = zi
-            self.lon = lon
-            self.z = z
-            self.values = values
-            self.offsets = grid_offsets
+            self.height_mask = zi > h_new
+            self.loni = loni        # (nx,)
+            self.zi = zi[:, 0] if zi.ndim == 2 else zi   # ensure (nz,)
 
 
     def clip_result_array(self):
@@ -225,27 +481,50 @@ class VerticalPlotter:
         Used to filter for only the valid data points. Takes away the artifacts of the slice generation. Sets terrain
         and too high points to nan.
         '''
-        lon_min, lon_max = self.lon.min(), self.lon.max()
-        z_min, z_max = self.z.min(), self.z.max()
-        lon_norm = (self.lon - lon_min) / (lon_max - lon_min)
-        z_norm = (self.z - z_min) / (z_max - z_min)
-        loni_norm = (self.loni - lon_min) / (lon_max - lon_min)
-        zi_norm = (self.zi - z_min) / (z_max - z_min)
 
-        tree = cKDTree(np.column_stack((lon_norm, z_norm)))
-        distances, _ = tree.query(np.column_stack((loni_norm.ravel(), zi_norm.ravel())))
-
-        threshold = 1
-
-        if self.scalar:
-            self.grid_values[distances.reshape(self.grid_values.shape) > threshold] = np.nan
+        if self.height_mask is not None:
+            if self.scalar:
+                self.grid_values = np.where(self.height_mask, self.grid_values, np.nan)
+            else:
+                self.grid_values_x = np.where(self.height_mask, self.grid_values_x, np.nan)
+                self.grid_values_y = np.where(self.height_mask, self.grid_values_y, np.nan)
+                self.grid_values_z = np.where(self.height_mask, self.grid_values_z, np.nan)
+                self.grid_values_lon = np.where(self.height_mask, self.grid_values_lon, np.nan)
+                self.grid_values_z_new = np.where(self.height_mask, self.grid_values_z_new, np.nan)
+                self.offsets = np.where(self.height_mask, self.offsets, np.nan)
+                if self.rv_mode:
+                    self.rv_grid = np.where(self.height_mask, self.rv_grid, np.nan)
         else:
-            self.grid_values_x[distances.reshape(self.grid_values_x.shape) > threshold] = np.nan
-            self.grid_values_y[distances.reshape(self.grid_values_y.shape) > threshold] = np.nan
-            self.grid_values_z[distances.reshape(self.grid_values_z.shape) > threshold] = np.nan
-            self.grid_values_lon[distances.reshape(self.grid_values_lon.shape) > threshold] = np.nan
-            self.grid_values_z_new[distances.reshape(self.grid_values_z_new.shape) > threshold] = np.nan
-            self.offsets[distances.reshape(self.offsets.shape) > threshold] = np.nan
+            lon_min, lon_max = self.lon.min(), self.lon.max()
+            z_min, z_max = self.z.min(), self.z.max()
+            lon_norm = (self.lon - lon_min) / (lon_max - lon_min)
+            z_norm = (self.z - z_min) / (z_max - z_min)
+            loni_norm = (self.loni - lon_min) / (lon_max - lon_min)
+            zi_norm = (self.zi - z_min) / (z_max - z_min)
+
+            pts = np.column_stack((lon_norm, z_norm))
+            grid_pts = np.column_stack((loni_norm.ravel(), zi_norm.ravel()))
+
+            tree = cKDTree(pts)
+            distances, _ = tree.query(grid_pts, k=1)
+
+            sample_dists, _ = tree.query(pts, k=2)
+            nn_spacing = np.median(sample_dists[:, 1])
+
+            threshold = 0.015 #0.015 #0.02
+
+            if self.scalar:
+                self.grid_values[distances.reshape(self.grid_values.shape) > threshold] = np.nan
+            else:
+                self.grid_values_x[distances.reshape(self.grid_values_x.shape) > threshold] = np.nan
+                self.grid_values_y[distances.reshape(self.grid_values_y.shape) > threshold] = np.nan
+                self.grid_values_z[distances.reshape(self.grid_values_z.shape) > threshold] = np.nan
+                self.grid_values_lon[distances.reshape(self.grid_values_lon.shape) > threshold] = np.nan
+                self.grid_values_z_new[distances.reshape(self.grid_values_z_new.shape) > threshold] = np.nan
+                self.offsets[distances.reshape(self.offsets.shape) > threshold] = np.nan
+                if self.rv_mode:
+                    self.rv_grid[distances.reshape(self.rv_grid.shape) > threshold] = np.nan
+
 
 
     def return_interpolation_result(self):
@@ -269,12 +548,15 @@ class VerticalPlotter:
                 'z': self.grid_values_z,
                 'lon': self.grid_values_lon,
                 'z_new': self.grid_values_z_new,
-                'offset': self.offsets
+                'offset': self.offsets,
             }
             result['interpolation_grid'] = {
                 'lon': self.loni,
                 'z': self.zi
             }
+
+        if self.rv_mode:
+            result['grid_values']['rv_grid'] = self.rv_grid
 
         return result
 
@@ -301,13 +583,19 @@ class VerticalPlotter:
 
         extent = [self.lon.min(), self.lon.max(), self.z.min(), self.z.max()]
 
-        cmap = plt.get_cmap(cmap_name, bins).copy()
+        if self.rv_mode:
+            cmap = plt.get_cmap("coolwarm", bins).copy()
+        else:
+            cmap = plt.get_cmap(cmap_name, bins).copy()
 
         if label == None:
             label = self.plot_variable
 
-        if self.scalar:
-            vmin, vmax = np.nanmin(self.grid_values), np.nanmax(self.grid_values)
+        if self.scalar or self.rv_mode:
+            if self.rv_mode:
+                vmin, vmax = np.nanmin(self.rv_grid), np.nanmax(self.rv_grid)
+            else:
+                vmin, vmax = np.nanmin(self.grid_values), np.nanmax(self.grid_values)
             if discrete:
                 colors = cmap(np.linspace(0, 1, bins))
                 new_cmap = mcolors.ListedColormap(colors)
@@ -318,11 +606,17 @@ class VerticalPlotter:
 
             fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(10, 6))
 
-            img1 = ax.imshow(self.grid_values, origin='lower', extent=extent, cmap=new_cmap, vmin=vmin, vmax=vmax)
+            if self.rv_mode:
+                img1 = ax.imshow(self.rv_grid, origin='lower', extent=extent, cmap=new_cmap, vmin=vmin, vmax=vmax)
+            else:
+                img1 = ax.imshow(self.grid_values, origin='lower', extent=extent, cmap=new_cmap, vmin=vmin, vmax=vmax)
             fig.colorbar(img1, ax=ax, shrink=0.5, label=label)
 
             if contour:
-                contour = ax.contour(self.grid_values, levels=c_lines, colors=c_color, linewidths=1, extent=extent)
+                if self.rv_mode:
+                    contour = ax.contour(self.rv_grid, levels=c_lines, colors=c_color, linewidths=1, extent=extent)
+                else:
+                    contour = ax.contour(self.grid_values, levels=c_lines, colors=c_color, linewidths=1, extent=extent)
                 ax.clabel(contour, inline=True, fontsize=10, fmt="%.0f")
 
             ax.set_xlabel("Line Distance (m)")
@@ -353,7 +647,7 @@ class VerticalPlotter:
                 V_sub = V[::step, ::step]
                 magnitude_sub = magnitude[::step, ::step]
 
-                print(X_sub.shape, Y_sub.shape, U_sub.shape, V_sub.shape, self.offsets[::step, ::step].shape)
+                #print(X_sub.shape, Y_sub.shape, U_sub.shape, V_sub.shape, self.offsets[::step, ::step].shape)
 
                 if offset:
                     vmin, vmax = np.nanmin(self.offsets[::step, ::step]), np.nanmax(self.offsets[::step, ::step])
@@ -525,7 +819,7 @@ class VerticalPlotter:
                  plot_type='standard', nan_color="black",
                  cmap_name='viridis', label=None, discrete=True,
                  contour=True, bins=10, c_lines=10, c_color='black',
-                 scale=100, density=2, save_as='test'):
+                 scale=100, density=2, save_as='test', rv_mode=False, invert=True, station_coords=None):
 
         '''
         Performes a full run of the vertical profile plot workflow and generate the result arrays. Return and automatically plots are optional.
@@ -553,7 +847,7 @@ class VerticalPlotter:
             self.adadpt_z(col_new=height_col_name)
         self.gpd_line_2_pv_line(number_line_points)
         self.generate_icon_slice()
-        self.interpolate_icon_slice()
+        self.interpolate_icon_slice(rv_mode=rv_mode, invert=invert, station_coords=station_coords)
         self.clip_result_array()
         if plot_3D:
             self.pv_3d_visualization()
@@ -570,18 +864,11 @@ class VerticalPlotter:
 
 def main():
 
-    icon_vtk_1 = pv.read(r"..\Flowspline_Data\icon_mesh.vtk")
-    icon_vtk_2 = pv.read(r"..\Flowspline_Data\icon_mesh_theta_v.vtk")
-    gdf_line = gpd.read_file(r"..\Flowspline_Data\hef_flowline.shp")
+    icon_vtk = pv.read(r"test_vtk.vtk")
+    gdf_line = gpd.read_file(r"testline_25.geojson")
 
-    print(icon_vtk_2.array_names)
-    #print(icon_vtk.points[:5,:])
-
-    VP_1 = VerticalPlotter(icon_vtk_1, "EPSG:32632", gdf_line, 'theta', max_height=[4000, 3800], grid_width=1, interp_method='linear')
-    _ = VP_1.full_run(plot_type='standard', number_line_points=1000, save_as="Theta_Spline", plot_3D=True)
-
-    VP_2 = VerticalPlotter(icon_vtk_2, "EPSG:32632", gdf_line, 'theta_v', max_height=[4000, 3800], grid_width=1, interp_method='linear')
-    _ = VP_2.full_run(plot_type='standard', number_line_points=1000, save_as="Theta_v_Spline", plot_3D=True)
+    VP_1 = VerticalPlotter(icon_vtk, "EPSG:32632", gdf_line, 'theta_v', max_height=[4000, 3800], grid_width=1, interp_method='linear')
+    _ = VP_1.full_run(plot_type='standard', number_line_points=1000, save_as="Theta_Spline", plot_3D=False)
 
 
 
